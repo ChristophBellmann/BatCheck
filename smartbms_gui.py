@@ -5,7 +5,6 @@ import threading
 import datetime
 import csv
 import os
-import subprocess
 from bleak import BleakClient
 
 devices = {
@@ -35,22 +34,14 @@ device_data = {
 stop_event = threading.Event()
 log_active = threading.Event()
 
-def disconnect_bluetooth_devices(mac_list):
-    for mac in mac_list:
-        try:
-            print(f"Trenne Bluetooth-Gerät {mac} ...")
-            subprocess.run(
-                ['bluetoothctl', 'disconnect', mac],
-                check=False,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-        except Exception as e:
-            print(f"Fehler beim Trennen von {mac}: {e}")
-
 def parse_cell_voltages(packet):
+    # BMS Zellpaket: DD 04 ... ... ... 77
     if not packet.startswith(b'\xDD') or packet[1] != 0x04 or packet[-1] != 0x77:
         return []
-    data = packet[4:-3]
+    # Im JBD-Protokoll steht im 4. Byte die Länge (z. B. 32 für 16 Zellen)
+    # Header ist 4 Bytes (DD 04 LEN xx), dann die Daten, dann CRC (2B) und 77
+    length = packet[3]
+    data = packet[4:4+length]
     voltages = []
     for i in range(0, len(data), 2):
         if i + 1 >= len(data): break
@@ -59,10 +50,12 @@ def parse_cell_voltages(packet):
     return voltages
 
 def parse_status(packet):
+    # BMS Statuspaket: DD 03 ... ... ... 77
     if not packet.startswith(b'\xDD') or packet[1] != 0x03 or packet[-1] != 0x77:
         return {}
+    length = packet[3]
     d = packet
-    # >>> KORREKT: ab Byte 4! (nicht 5!)
+    # Achtung: Indexierung je nach Protokoll
     total_v = int.from_bytes(d[4:6], "big") / 100.0
     strom_raw = int.from_bytes(d[6:8], "big", signed=True)
     strom = strom_raw / 100.0
@@ -90,16 +83,32 @@ def handle_notify(name, data):
     buf = notify_buffer[name]
     buf += data
     while True:
-        if len(buf) < 7: break
+        # Suche Start (0xDD) und prüfe, ob noch ein ganzes Paket vorhanden ist
+        if len(buf) < 7: break  # zu kurz
         try:
             start = buf.index(0xDD)
-            end = buf.index(0x77, start)
-        except ValueError: break
-        packet = buf[start:end+1]
-        buf = buf[end+1:]
+        except ValueError:
+            buf = bytearray()  # kein Paket
+            break
+        if len(buf) - start < 7: break  # Rest zu kurz
+        typ = buf[start+1]
+        # Lese die Länge
+        packet_len = buf[start+3]
+        # Berechne erwartete Gesamtlänge
+        # (Start, Typ, LEN, ... Daten[LEN], CRC[2], End[1])
+        total_len = 4 + packet_len + 2 + 1
+        if len(buf) - start < total_len:
+            # Warte auf den Rest
+            break
+        packet = buf[start:start+total_len]
+        # Debug-Ausgabe
         print(f"[{name}] [RAW] {packet.hex()}")
-        if len(packet) > 4 and packet[1] == 0x04:
+        # Typ entscheiden:
+        if typ == 0x04:
+            # Zellenpaket
             voltages = parse_cell_voltages(packet)
+            if len(voltages) == 0:
+                print(f"[{name}] ⚠️ Ungültiges Zellenpaket!")
             device_data[name]["voltages"] = voltages + [0.0]*(16-len(voltages))
             now = datetime.datetime.now().strftime("%H:%M:%S")
             device_data[name]["last_update"] = now
@@ -108,14 +117,19 @@ def handle_notify(name, data):
             if log_active.is_set() and voltages:
                 with open(csv_paths[name], "a", newline="") as f:
                     csv.writer(f).writerow([now]+voltages)
-        elif len(packet) > 4 and packet[1] == 0x03:
+        elif typ == 0x03:
+            # Statuspaket
             s = parse_status(packet)
             if s:
                 device_data[name]["strom"] = s["strom"]
                 device_data[name]["soc"] = s["soc"]
                 if not any(device_data[name]["voltages"]):
                     device_data[name]["total"] = s["total"]
-        notify_buffer[name] = buf
+        else:
+            print(f"[{name}] ⚠️ Unbekannter Pakettyp {typ:02X}")
+        # Nächstes Paket aus Buffer holen
+        buf = buf[start+total_len:]
+    notify_buffer[name] = buf
 
 class BMSGUI(tk.Tk):
     def __init__(self):
@@ -225,8 +239,6 @@ class BMSGUI(tk.Tk):
 
     def stop(self):
         stop_event.set()
-        # Optional: Devices beim Exit disconnecten
-        disconnect_bluetooth_devices(devices.values())
         self.destroy()
         print("⛔️ Beende Programm...")
 
@@ -250,8 +262,6 @@ def run_asyncio_thread():
         loop.close()
 
 if __name__ == "__main__":
-    # Disconnect all devices before starting
-    disconnect_bluetooth_devices(devices.values())
     gui = BMSGUI()
     setup_styles(gui)
     t = threading.Thread(target=run_asyncio_thread, daemon=True)
