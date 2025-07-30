@@ -5,6 +5,7 @@ import threading
 import datetime
 import csv
 import os
+import subprocess
 from bleak import BleakClient
 
 devices = {
@@ -34,6 +35,18 @@ device_data = {
 stop_event = threading.Event()
 log_active = threading.Event()
 
+def disconnect_bluetooth_devices(mac_list):
+    for mac in mac_list:
+        try:
+            print(f"Trenne Bluetooth-Gerät {mac} ...")
+            subprocess.run(
+                ['bluetoothctl', 'disconnect', mac],
+                check=False,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+        except Exception as e:
+            print(f"Fehler beim Trennen von {mac}: {e}")
+
 def parse_cell_voltages(packet):
     if not packet.startswith(b'\xDD') or packet[1] != 0x04 or packet[-1] != 0x77:
         return []
@@ -49,6 +62,7 @@ def parse_status(packet):
     if not packet.startswith(b'\xDD') or packet[1] != 0x03 or packet[-1] != 0x77:
         return {}
     d = packet
+    # >>> KORREKT: ab Byte 4! (nicht 5!)
     total_v = int.from_bytes(d[4:6], "big") / 100.0
     strom_raw = int.from_bytes(d[6:8], "big", signed=True)
     strom = strom_raw / 100.0
@@ -89,7 +103,6 @@ def handle_notify(name, data):
             device_data[name]["voltages"] = voltages + [0.0]*(16-len(voltages))
             now = datetime.datetime.now().strftime("%H:%M:%S")
             device_data[name]["last_update"] = now
-            # **Gesamtspannung = Summe Zellspannungen**
             if voltages:
                 device_data[name]["total"] = sum(voltages)
             if log_active.is_set() and voltages:
@@ -98,7 +111,6 @@ def handle_notify(name, data):
         elif len(packet) > 4 and packet[1] == 0x03:
             s = parse_status(packet)
             if s:
-                # Strom & SoC (Gesamtspannung nehmen wir NUR als fallback)
                 device_data[name]["strom"] = s["strom"]
                 device_data[name]["soc"] = s["soc"]
                 if not any(device_data[name]["voltages"]):
@@ -213,6 +225,8 @@ class BMSGUI(tk.Tk):
 
     def stop(self):
         stop_event.set()
+        # Optional: Devices beim Exit disconnecten
+        disconnect_bluetooth_devices(devices.values())
         self.destroy()
         print("⛔️ Beende Programm...")
 
@@ -236,6 +250,8 @@ def run_asyncio_thread():
         loop.close()
 
 if __name__ == "__main__":
+    # Disconnect all devices before starting
+    disconnect_bluetooth_devices(devices.values())
     gui = BMSGUI()
     setup_styles(gui)
     t = threading.Thread(target=run_asyncio_thread, daemon=True)
